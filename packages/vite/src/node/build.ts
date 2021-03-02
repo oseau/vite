@@ -15,7 +15,6 @@ import Rollup, {
   GetModuleInfo
 } from 'rollup'
 import { buildReporterPlugin } from './plugins/reporter'
-import { buildDefinePlugin } from './plugins/define'
 import { buildHtmlPlugin } from './plugins/html'
 import { buildEsbuildPlugin } from './plugins/esbuild'
 import { terserPlugin } from './plugins/terser'
@@ -29,10 +28,12 @@ import { Logger } from './logger'
 import { TransformOptions } from 'esbuild'
 import { CleanCSS } from 'types/clean-css'
 import { dataURIPlugin } from './plugins/dataUri'
-import { buildImportAnalysisPlugin } from './plugins/importAnaysisBuild'
-import { resolveSSRExternal } from './ssr/ssrExternal'
+import { buildImportAnalysisPlugin } from './plugins/importAnalysisBuild'
+import { resolveSSRExternal, shouldExternalizeForSSR } from './ssr/ssrExternal'
 import { ssrManifestPlugin } from './ssr/ssrManifestPlugin'
 import { isCSSRequest } from './plugins/css'
+import { DepOptimizationMetadata } from './optimizer'
+import { scanImports } from './optimizer/scan'
 
 export interface BuildOptions {
   /**
@@ -165,6 +166,16 @@ export interface BuildOptions {
    * directives in production.
    */
   ssrManifest?: boolean
+  /**
+   * Set to false to disable brotli compressed size reporting for build.
+   * Can slightly improve build speed.
+   */
+  brotliSize?: boolean
+  /**
+   * Adjust chunk size warning limit (in kbs).
+   * @default 500
+   */
+  chunkSizeWarningLimit?: number
 }
 
 export interface LibraryOptions {
@@ -201,6 +212,8 @@ export function resolveBuildOptions(raw?: BuildOptions): ResolvedBuildOptions {
     lib: false,
     ssr: false,
     ssrManifest: false,
+    brotliSize: true,
+    chunkSizeWarningLimit: 500,
     ...raw
   }
 
@@ -230,7 +243,6 @@ export function resolveBuildPlugins(
       buildHtmlPlugin(config),
       commonjsPlugin(options.commonjsOptions),
       dataURIPlugin(),
-      buildDefinePlugin(config),
       dynamicImportVars({
         warnOnError: true,
         exclude: [/node_modules/]
@@ -245,9 +257,7 @@ export function resolveBuildPlugins(
         : []),
       ...(options.manifest ? [manifestPlugin(config)] : []),
       ...(options.ssrManifest ? [ssrManifestPlugin(config)] : []),
-      ...(!config.logLevel || config.logLevel === 'info'
-        ? [buildReporterPlugin(config)]
-        : [])
+      buildReporterPlugin(config)
     ]
   }
 }
@@ -289,7 +299,11 @@ async function doBuild(
   const libOptions = options.lib
 
   config.logger.info(
-    chalk.cyan(`building ${ssr ? `SSR bundle ` : ``}for ${config.mode}...`)
+    chalk.cyan(
+      `vite v${require('vite/package.json').version} ${chalk.green(
+        `building ${ssr ? `SSR bundle ` : ``}for ${config.mode}...`
+      )}`
+    )
   )
 
   const resolve = (p: string) => path.resolve(config.root, p)
@@ -315,9 +329,28 @@ async function doBuild(
 
   // inject ssrExternal if present
   const userExternal = options.rollupOptions?.external
-  const external = ssr
-    ? resolveExternal(resolveSSRExternal(config), userExternal)
-    : userExternal
+  let external = userExternal
+  if (ssr) {
+    // see if we have cached deps data available
+    let knownImports: string[] | undefined
+    if (config.optimizeCacheDir) {
+      const dataPath = path.join(config.optimizeCacheDir, '_metadata.json')
+      try {
+        const data = JSON.parse(
+          fs.readFileSync(dataPath, 'utf-8')
+        ) as DepOptimizationMetadata
+        knownImports = Object.keys(data.optimized)
+      } catch (e) {}
+    }
+    if (!knownImports) {
+      // no dev deps optimization data, do a fresh scan
+      knownImports = Object.keys((await scanImports(config)).deps)
+    }
+    external = resolveExternal(
+      resolveSSRExternal(config, knownImports),
+      userExternal
+    )
+  }
 
   const rollup = require('rollup') as typeof Rollup
 
@@ -561,18 +594,32 @@ export function onRollupWarning(
   }
 }
 
-export function resolveExternal(
-  existing: string[],
+function resolveExternal(
+  ssrExternals: string[],
   user: ExternalOption | undefined
 ): ExternalOption {
-  if (!user) return existing
-  if (typeof user !== 'function') {
-    return existing.concat(user as any[])
-  }
   return ((id, parentId, isResolved) => {
-    if (existing.includes(id)) return true
-    return user(id, parentId, isResolved)
+    if (shouldExternalizeForSSR(id, ssrExternals)) {
+      return true
+    }
+    if (user) {
+      if (typeof user === 'function') {
+        return user(id, parentId, isResolved)
+      } else if (Array.isArray(user)) {
+        return user.some((test) => isExternal(id, test))
+      } else {
+        return isExternal(id, user)
+      }
+    }
   }) as ExternalOption
+}
+
+function isExternal(id: string, test: string | RegExp) {
+  if (typeof test === 'string') {
+    return id === test
+  } else {
+    return test.test(id)
+  }
 }
 
 function injectSsrFlagToHooks(p: Plugin): Plugin {

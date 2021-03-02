@@ -21,7 +21,7 @@ Legacy browsers can be supported via [@vitejs/plugin-legacy](https://github.com/
 
 ## Public Base Path
 
-- Related: [Asset Handling](./features#asset-handling)
+- Related: [Asset Handling](./assets)
 
 If you are deploying your project under a nested public path, simply specify the [`base` config option](/config/#base) and all asset paths will be rewritten accordingly. This option can also be specified as a command line flag, e.g. `vite build --base=/my/public/path/`.
 
@@ -51,13 +51,13 @@ For example, you can specify multiple Rollup outputs with plugins that are only 
 Suppose you have the following source code structure:
 
 ```
-|-package.json
-|-vite.config.js
-|-index.html
-|-main.js
-|-nested/
-|---index.html
-|---nested.js
+├── package.json
+├── vite.config.js
+├── index.html
+├── main.js
+└── nested
+    ├── index.html
+    └── nested.js
 ```
 
 During dev, simply navigate or link to `/nested/` - it works as expected, just like for a normal static file server.

@@ -19,7 +19,11 @@ import dotenv from 'dotenv'
 import dotenvExpand from 'dotenv-expand'
 import { Alias, AliasOptions } from 'types/alias'
 import { CLIENT_DIR, DEFAULT_ASSETS_RE, DEP_CACHE_DIR } from './constants'
-import { resolvePlugin } from './plugins/resolve'
+import {
+  InternalResolveOptions,
+  ResolveOptions,
+  resolvePlugin
+} from './plugins/resolve'
 import { createLogger, Logger, LogLevel } from './logger'
 import { DepOptimizationOptions } from './optimizer'
 import { createFilter } from '@rollup/pluginutils'
@@ -34,6 +38,8 @@ import aliasPlugin from '@rollup/plugin-alias'
 
 const debug = createDebugger('vite:config')
 
+// NOTE: every export in this file is re-exported from ./index.ts so it will
+// be part of the public API.
 export interface ConfigEnv {
   command: 'build' | 'serve'
   mode: string
@@ -77,10 +83,6 @@ export interface UserConfig {
    */
   mode?: string
   /**
-   * Import aliases
-   */
-  alias?: AliasOptions
-  /**
    * Define global variable replacements.
    * Entries will be defined on `window` during dev and replaced during build.
    */
@@ -89,6 +91,10 @@ export interface UserConfig {
    * Array of vite plugins to use.
    */
   plugins?: (Plugin | Plugin[])[]
+  /**
+   * Configure resolver
+   */
+  resolve?: ResolveOptions & { alias?: AliasOptions }
   /**
    * CSS related options (preprocessors and CSS modules)
    */
@@ -124,11 +130,6 @@ export interface UserConfig {
    */
   ssr?: SSROptions
   /**
-   * Force Vite to always resolve listed dependencies to the same copy (from
-   * project root).
-   */
-  dedupe?: string[]
-  /**
    * Log level.
    * Default: 'info'
    */
@@ -137,6 +138,17 @@ export interface UserConfig {
    * Default: true
    */
   clearScreen?: boolean
+  /**
+   * Import aliases
+   * @deprecated use `resolve.alias` instead
+   */
+  alias?: AliasOptions
+  /**
+   * Force Vite to always resolve listed dependencies to the same copy (from
+   * project root).
+   * @deprecated use `resolve.dedupe` instead
+   */
+  dedupe?: string[]
 }
 
 export interface SSROptions {
@@ -149,7 +161,7 @@ export interface InlineConfig extends UserConfig {
 }
 
 export type ResolvedConfig = Readonly<
-  Omit<UserConfig, 'plugins' | 'alias' | 'assetsInclude'> & {
+  Omit<UserConfig, 'plugins' | 'alias' | 'dedupe' | 'assetsInclude'> & {
     configFile: string | undefined
     inlineConfig: UserConfig
     root: string
@@ -160,18 +172,15 @@ export type ResolvedConfig = Readonly<
     isProduction: boolean
     optimizeCacheDir: string | undefined
     env: Record<string, any>
-    alias: Alias[]
+    resolve: ResolveOptions & {
+      alias: Alias[]
+    }
     plugins: readonly Plugin[]
     server: ServerOptions
     build: ResolvedBuildOptions
     assetsInclude: (file: string) => boolean
     logger: Logger
-    createResolver: (options?: {
-      asSrc?: boolean
-      tryIndex?: boolean | string
-      extensions?: string[]
-      relativeFirst?: boolean
-    }) => ResolveFn
+    createResolver: (options?: Partial<InternalResolveOptions>) => ResolveFn
   }
 >
 
@@ -197,13 +206,15 @@ export async function resolveConfig(
     process.env.NODE_ENV = 'production'
   }
 
+  const configEnv = {
+    mode,
+    command
+  }
+
   let { configFile } = config
   if (configFile !== false) {
     const loadResult = await loadConfigFromFile(
-      {
-        mode,
-        command
-      },
+      configEnv,
       configFile,
       config.root,
       config.logLevel
@@ -228,7 +239,7 @@ export async function resolveConfig(
   const userPlugins = [...prePlugins, ...normalPlugins, ...postPlugins]
   userPlugins.forEach((p) => {
     if (p.config) {
-      const res = p.config(config)
+      const res = p.config(config, configEnv)
       if (res) {
         config = mergeConfig(config, res)
       }
@@ -247,8 +258,14 @@ export async function resolveConfig(
     // @ts-ignore because @rollup/plugin-alias' type doesn't allow function
     // replacement, but its implementation does work with function values.
     [{ find: /^\/@vite\//, replacement: () => CLIENT_DIR + '/' }],
-    config.alias || []
+    config.resolve?.alias || config.alias || []
   )
+
+  const resolveOptions: ResolvedConfig['resolve'] = {
+    dedupe: config.dedupe,
+    ...config.resolve,
+    alias: resolvedAlias
+  }
 
   // load .env files
   const userEnv = loadEnv(mode, resolvedRoot)
@@ -263,33 +280,8 @@ export async function resolveConfig(
   }
 
   // resolve public base url
-  // TODO remove when out of beta
-  if (config.build?.base) {
-    logger.warn(
-      chalk.yellow.bold(
-        `(!) "build.base" config option is deprecated. ` +
-          `"base" is now a root-level config option.`
-      )
-    )
-    config.base = config.build.base
-  }
-
   const BASE_URL = resolveBaseUrl(config.base, command === 'build', logger)
   const resolvedBuildOptions = resolveBuildOptions(config.build)
-
-  // TODO remove when out of beta
-  Object.defineProperty(resolvedBuildOptions, 'base', {
-    get() {
-      logger.warn(
-        chalk.yellow.bold(
-          `(!) "build.base" config option is deprecated. ` +
-            `"base" is now a root-level config option.\n` +
-            new Error().stack
-        )
-      )
-      return config.base
-    }
-  })
 
   // resolve optimizer cache directory
   const pkgPath = lookupFile(
@@ -316,7 +308,7 @@ export async function resolveConfig(
           aliasContainer ||
           (aliasContainer = await createPluginContainer({
             ...resolved,
-            plugins: [aliasPlugin({ entries: resolved.alias })]
+            plugins: [aliasPlugin({ entries: resolved.resolve.alias })]
           }))
       } else {
         container =
@@ -324,16 +316,16 @@ export async function resolveConfig(
           (resolverContainer = await createPluginContainer({
             ...resolved,
             plugins: [
-              aliasPlugin({ entries: resolved.alias }),
+              aliasPlugin({ entries: resolved.resolve.alias }),
               resolvePlugin({
+                ...resolved.resolve,
                 root: resolvedRoot,
-                dedupe: resolved.dedupe,
                 isProduction,
                 isBuild: command === 'build',
-                asSrc: options?.asSrc ?? true,
-                relativeFirst: options?.relativeFirst ?? false,
-                tryIndex: options?.tryIndex ?? true,
-                extensions: options?.extensions
+                asSrc: true,
+                preferRelative: false,
+                tryIndex: true,
+                ...options
               })
             ]
           }))
@@ -348,12 +340,12 @@ export async function resolveConfig(
     inlineConfig,
     root: resolvedRoot,
     base: BASE_URL,
+    resolve: resolveOptions,
     publicDir: path.resolve(resolvedRoot, config.publicDir || 'public'),
     command,
     mode,
     isProduction,
     optimizeCacheDir,
-    alias: resolvedAlias,
     plugins: userPlugins,
     server: config.server || {},
     build: resolvedBuildOptions,
@@ -391,6 +383,71 @@ export async function resolveConfig(
       plugins: resolved.plugins.map((p) => p.name)
     })
   }
+
+  // TODO Deprecation warnings - remove when out of beta
+  if (config.build?.base) {
+    logger.warn(
+      chalk.yellow.bold(
+        `(!) "build.base" config option is deprecated. ` +
+          `"base" is now a root-level config option.`
+      )
+    )
+    config.base = config.build.base
+  }
+  Object.defineProperty(resolvedBuildOptions, 'base', {
+    enumerable: false,
+    get() {
+      logger.warn(
+        chalk.yellow.bold(
+          `(!) "build.base" config option is deprecated. ` +
+            `"base" is now a root-level config option.\n` +
+            new Error().stack
+        )
+      )
+      return resolved.base
+    }
+  })
+
+  if (config.alias) {
+    logger.warn(
+      chalk.bold.yellow(
+        '(!) "alias" option is deprecated. Use "resolve.alias" instead.'
+      )
+    )
+  }
+  Object.defineProperty(resolved, 'alias', {
+    enumerable: false,
+    get() {
+      logger.warn(
+        chalk.yellow.bold(
+          `(!) "alias" config option is deprecated. Use "resolve.alias" instead.\n` +
+            new Error().stack
+        )
+      )
+      return resolved.resolve.alias
+    }
+  })
+
+  if (config.dedupe) {
+    logger.warn(
+      chalk.bold.yellow(
+        '(!) "dedupe" option is deprecated. Use "resolve.dedupe" instead.'
+      )
+    )
+  }
+  Object.defineProperty(resolved, 'dedupe', {
+    enumerable: false,
+    get() {
+      logger.warn(
+        chalk.yellow.bold(
+          `(!) "dedupe" config option is deprecated. Use "resolve.dedupe" instead.\n` +
+            new Error().stack
+        )
+      )
+      return resolved.resolve.dedupe
+    }
+  })
+
   return resolved
 }
 
@@ -621,9 +678,11 @@ export async function loadConfigFromFile(
         const ignored = new RegExp(
           [
             `Cannot use import statement`,
-            `Unexpected token 'export'`,
             `Must use import to load ES Module`,
-            `Unexpected identifier` // #1635 Node <= 12.4 has no esm detection
+            // #1635, #2050 some Node 12.x versions don't have esm detection
+            // so it throws normal syntax errors when encountering esm syntax
+            `Unexpected token`,
+            `Unexpected identifier`
           ].join('|')
         )
         if (!ignored.test(e.message)) {

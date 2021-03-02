@@ -4,7 +4,7 @@ import {
   isModernFlag,
   preloadMethod,
   preloadMarker
-} from './plugins/importAnaysisBuild'
+} from './plugins/importAnalysisBuild'
 import { cleanUrl } from './utils'
 import { RollupError } from 'rollup'
 
@@ -13,7 +13,9 @@ export async function transformImportGlob(
   pos: number,
   importer: string,
   importIndex: number,
-  normalizeUrl?: (url: string, pos: number) => Promise<[string, string]>
+  root: string,
+  normalizeUrl?: (url: string, pos: number) => Promise<[string, string]>,
+  ssr = false
 ): Promise<{
   importsString: string
   imports: string[]
@@ -35,27 +37,39 @@ export async function transformImportGlob(
   const importerBasename = path.basename(importer)
 
   let [pattern, endIndex] = lexGlobPattern(source, pos)
-  if (!pattern.startsWith('.')) {
-    throw err(`pattern must start with "."`)
+  if (!pattern.startsWith('.') && !pattern.startsWith('/')) {
+    throw err(`pattern must start with "." or "/" (relative to project root)`)
   }
-  let base = path.dirname(importer)
+  let base
   let parentDepth = 0
-  while (pattern.startsWith('../')) {
-    pattern = pattern.slice(3)
-    base = path.resolve(base, '../')
-    parentDepth++
+  let isAbsolute = pattern.startsWith('/')
+  if (isAbsolute) {
+    base = path.resolve(root)
+    pattern = pattern.slice(1)
+  } else {
+    base = path.dirname(importer)
+    while (pattern.startsWith('../')) {
+      pattern = pattern.slice(3)
+      base = path.resolve(base, '../')
+      parentDepth++
+    }
+    if (pattern.startsWith('./')) {
+      pattern = pattern.slice(2)
+    }
   }
-  if (pattern.startsWith('./')) {
-    pattern = pattern.slice(2)
-  }
-  const files = glob.sync(pattern, { cwd: base })
+  const files = glob.sync(pattern, {
+    cwd: base,
+    ignore: ['**/node_modules/**']
+  })
   const imports: string[] = []
   let importsString = ``
   let entries = ``
   for (let i = 0; i < files.length; i++) {
     // skip importer itself
     if (files[i] === importerBasename) continue
-    const file = parentDepth
+    const file = isAbsolute
+      ? `/${files[i]}`
+      : parentDepth
       ? `${'../'.repeat(parentDepth)}${files[i]}`
       : `./${files[i]}`
     let importee = file
@@ -71,7 +85,7 @@ export async function transformImportGlob(
       entries += ` ${JSON.stringify(file)}: ${identifier},`
     } else {
       let imp = `import(${JSON.stringify(importee)})`
-      if (!normalizeUrl) {
+      if (!normalizeUrl && !ssr) {
         imp =
           `(${isModernFlag}` +
           `? ${preloadMethod}(()=>${imp},"${preloadMarker}")` +

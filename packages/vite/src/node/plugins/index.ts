@@ -13,6 +13,7 @@ import { wasmPlugin } from './wasm'
 import { webWorkerPlugin } from './worker'
 import { dynamicImportPolyfillPlugin } from './dynamicImportPolyfill'
 import { preAliasPlugin } from './preAlias'
+import { definePlugin } from './define'
 
 export async function resolvePlugins(
   config: ResolvedConfig,
@@ -28,14 +29,14 @@ export async function resolvePlugins(
 
   return [
     isBuild ? null : preAliasPlugin(),
-    aliasPlugin({ entries: config.alias }),
+    aliasPlugin({ entries: config.resolve.alias }),
     ...prePlugins,
     config.build.polyfillDynamicImport
       ? dynamicImportPolyfillPlugin(config)
       : null,
     resolvePlugin({
+      ...config.resolve,
       root: config.root,
-      dedupe: config.dedupe,
       isProduction: config.isProduction,
       isBuild,
       asSrc: true
@@ -54,6 +55,7 @@ export async function resolvePlugins(
     webWorkerPlugin(config),
     assetPlugin(config),
     ...normalPlugins,
+    definePlugin(config),
     cssPostPlugin(config),
     ...buildPlugins.pre,
     ...postPlugins,

@@ -1,6 +1,6 @@
 // @ts-check
 const fs = require('fs')
-const { transformSync } = require('@babel/core')
+const { transformSync, ParserOptions } = require('@babel/core')
 
 const runtimePublicPath = '/@react-refresh'
 const runtimeFilePath = require.resolve(
@@ -32,14 +32,16 @@ window.__vite_plugin_react_preamble_installed__ = true
 /**
  * Transform plugin for transforming and injecting per-file refresh code.
  *
- * @returns {import('vite').Plugin}
+ * @type {import('.').default}
  */
-module.exports = function reactRefreshPlugin() {
+function reactRefreshPlugin(opts) {
   let shouldSkip = false
   let base = '/'
 
   return {
     name: 'react-refresh',
+
+    enforce: 'pre',
 
     configResolved(config) {
       shouldSkip = config.command === 'build' || config.isProduction
@@ -73,10 +75,43 @@ module.exports = function reactRefreshPlugin() {
         return
       }
 
+      /**
+       * @type ParserOptions["plugins"]
+       */
+      const parserPlugins = [
+        'jsx',
+        'importMeta',
+        // since the plugin now applies before esbuild transforms the code,
+        // we need to enable some stage 3 syntax since they are supported in
+        // TS and some environments already.
+        'topLevelAwait',
+        'classProperties',
+        'classPrivateProperties',
+        'classPrivateMethods'
+      ]
+      if (/\.tsx?$/.test(id)) {
+        // it's a typescript file
+        // TODO: maybe we need to read tsconfig to determine parser plugins to
+        // enable here, but allowing decorators by default since it's very
+        // commonly used with TS.
+        parserPlugins.push('typescript', 'decorators-legacy')
+      }
+      if (opts && opts.parserPlugins) {
+        parserPlugins.push(...opts.parserPlugins)
+      }
+
       const isReasonReact = id.endsWith('.bs.js')
       const result = transformSync(code, {
+        configFile: false,
+        filename: id,
+        parserOpts: {
+          sourceType: 'module',
+          allowAwaitOutsideFunction: true,
+          plugins: parserPlugins
+        },
         plugins: [
-          require('@babel/plugin-syntax-import-meta'),
+          require('@babel/plugin-transform-react-jsx-self'),
+          require('@babel/plugin-transform-react-jsx-source'),
           [require('react-refresh/babel'), { skipEnvCheck: true }]
         ],
         ast: !isReasonReact,
@@ -97,7 +132,7 @@ module.exports = function reactRefreshPlugin() {
 
   if (!window.__vite_plugin_react_preamble_installed__) {
     throw new Error(
-      "vite-plugin-react can't detect preamble. Something is wrong" +
+      "vite-plugin-react can't detect preamble. Something is wrong. " +
       "See https://github.com/vitejs/vite-plugin-react/pull/11#discussion_r430879201"
     );
   }
@@ -151,8 +186,6 @@ module.exports = function reactRefreshPlugin() {
   }
 }
 
-module.exports.preambleCode = preambleCode
-
 /**
  * @param {import('@babel/core').BabelFileResult['ast']} ast
  */
@@ -181,3 +214,7 @@ function isRefreshBoundary(ast) {
 function isComponentishName(name) {
   return typeof name === 'string' && name[0] >= 'A' && name[0] <= 'Z'
 }
+
+module.exports = reactRefreshPlugin
+reactRefreshPlugin['default'] = reactRefreshPlugin
+reactRefreshPlugin.preambleCode = preambleCode

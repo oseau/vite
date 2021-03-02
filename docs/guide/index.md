@@ -1,6 +1,22 @@
 # Getting Started
 
-If you are interested to learn more about Vite before trying it, check out the [Introduction](./introduction) section.
+## Overview
+
+Vite (French word for "fast", pronounced `/vit/`) is a build tool that aims to provide a faster and leaner development experience for modern web projects. It consists of two major parts:
+
+- A dev server that provides [rich feature enhancements](./features) over [native ES modules](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Modules), for example extremely fast [Hot Module Replacement (HMR)](./features#hot-module-replacement).
+
+- A build command that bundles your code with [Rollup](https://rollupjs.org), pre-configured to output highly optimized static assets for production.
+
+Vite is opinionated and comes with sensible defaults out of the box, but is also highly extensible via its [Plugin API](./api-plugin) and [JavaScript API](./api-javascript) with full typing support.
+
+You can learn more about the rationale behind the project in the [Why Vite](./why) section.
+
+## Browser Support
+
+- For development: [native ESM dynamic import support](https://caniuse.com/es6-module-dynamic-import) is required.
+
+- For production: the default build targets browsers that support [native ESM via script tags](https://caniuse.com/es6-module). Legacy browsers can be supported via the official [@vitejs/plugin-legacy](https://github.com/vitejs/vite/tree/main/packages/plugin-legacy) - see the [Building for Production](./build) section for more details.
 
 ## Scaffolding Your First Vite Project
 
@@ -49,6 +65,24 @@ Supported template presets include:
 
 See [@vitejs/create-app](https://github.com/vitejs/vite/tree/main/packages/create-app) for more details on each template.
 
+## Community Templates
+
+@vitejs/create-app is a tool to quickly start a project from a basic template for popular frameworks. Check out Awesome Vite for [community maintained templates](https://github.com/vitejs/awesome-vite#templates) that include other tools or target different frameworks. You can use a tool like [degit](https://github.com/Rich-Harris/degit) to scaffold your project with one of the templates.
+
+```bash
+npx degit user/project my-project
+cd my-project
+
+npm install
+npm run dev
+```
+
+If the project uses `main` as the default branch, suffix the project repo with `#main`
+
+```bash
+npx degit user/project#main my-project
+```
+
 ## `index.html` and Project Root
 
 One thing you may have noticed is that in a Vite project, `index.html` is front-and-central instead of being tucked away inside `public`. This is intentional: during development Vite is a server, and `index.html` is the entry point to your application.
@@ -70,8 +104,9 @@ In a project where Vite is installed, you can use the `vite` binary in your npm 
 ```json
 {
   "scripts": {
-    "dev": "vite",
-    "build": "vite build"
+    "dev": "vite", // start dev server
+    "build": "vite build", // build for production
+    "serve": "vite preview" // locally preview production build
   }
 }
 ```

@@ -18,7 +18,11 @@ import { ensureService, stopService } from '../plugins/esbuild'
 
 const debug = createDebugger('vite:deps')
 
-export type ExportsData = [ImportSpecifier[], string[]]
+export type ExportsData = [ImportSpecifier[], string[]] & {
+  // es-module-lexer has a facade detection but isn't always accurate for our
+  // use case when the module has default export
+  hasReExports?: true
+}
 
 export interface DepOptimizationOptions {
   /**
@@ -33,7 +37,7 @@ export interface DepOptimizationOptions {
    */
   entries?: string | string[]
   /**
-   * Force optimize listed dependencies (must be resolvalble import paths,
+   * Force optimize listed dependencies (must be resolvable import paths,
    * cannot be globs).
    */
   include?: string[]
@@ -47,7 +51,7 @@ export interface DepOptimizationOptions {
 export interface DepOptimizationMetadata {
   /**
    * The main hash is determined by user config and dependency lockfiles.
-   * This is checked on server startup to avoid unncessary re-bundles.
+   * This is checked on server startup to avoid unnecessary re-bundles.
    */
   hash: string
   /**
@@ -184,7 +188,7 @@ export async function optimizeDeps(
       )
     }
   } else {
-    logger.info(chalk.greenBright(`Optimizing dependencies:\n${depsString}`))
+    logger.info(chalk.greenBright(`Optimizing dependencies:\n  ${depsString}`))
   }
 
   const esbuildMetaPath = path.join(cacheDir, '_esbuild.json')
@@ -203,9 +207,23 @@ export async function optimizeDeps(
   for (const id in deps) {
     const flatId = flattenId(id)
     flatIdDeps[flatId] = deps[id]
-    const exportsData = parse(fs.readFileSync(deps[id], 'utf-8'))
+    const entryContent = fs.readFileSync(deps[id], 'utf-8')
+    const exportsData = parse(entryContent) as ExportsData
+    for (const { ss, se } of exportsData[0]) {
+      const exp = entryContent.slice(ss, se)
+      if (/export\s+\*\s+from/.test(exp)) {
+        exportsData.hasReExports = true
+      }
+    }
     idToExports[id] = exportsData
     flatIdToExports[flatId] = exportsData
+  }
+
+  const define: Record<string, string> = {
+    'process.env.NODE_ENV': JSON.stringify(config.mode)
+  }
+  for (const key in config.define) {
+    define[key] = JSON.stringify(config.define[key])
   }
 
   const start = Date.now()
@@ -221,9 +239,7 @@ export async function optimizeDeps(
     outdir: cacheDir,
     treeShaking: 'ignore-annotations',
     metafile: esbuildMetaPath,
-    define: {
-      'process.env.NODE_ENV': '"development"'
-    },
+    define,
     plugins: [esbuildDepPlugin(flatIdDeps, flatIdToExports, config)]
   })
 
@@ -234,7 +250,7 @@ export async function optimizeDeps(
     data.optimized[id] = {
       file: normalizePath(path.resolve(cacheDir, flattenId(id) + '.js')),
       src: entry,
-      needsInterop: needsInterop(id, entry, idToExports[id], meta.outputs)
+      needsInterop: needsInterop(id, idToExports[id], meta.outputs)
     }
   }
 
@@ -254,7 +270,6 @@ const KNOWN_INTEROP_IDS = new Set(['moment'])
 
 function needsInterop(
   id: string,
-  entry: string,
   exportsData: ExportsData,
   outputs: Record<string, any>
 ): boolean {
@@ -273,8 +288,9 @@ function needsInterop(
   const flatId = flattenId(id) + '.js'
   let generatedExports: string[] | undefined
   for (const output in outputs) {
-    if (normalizePath(output).endsWith(flatId)) {
+    if (normalizePath(output).endsWith('.vite/' + flatId)) {
       generatedExports = outputs[output].exports
+      break
     }
   }
 
@@ -306,8 +322,7 @@ function getDepHash(root: string, config: ResolvedConfig): string {
     {
       mode: config.mode,
       root: config.root,
-      alias: config.alias,
-      dedupe: config.dedupe,
+      resolve: config.resolve,
       assetsInclude: config.assetsInclude,
       plugins: config.plugins.map((p) => p.name),
       optimizeDeps: {

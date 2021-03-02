@@ -1,10 +1,9 @@
 import fs from 'fs'
 import path from 'path'
+import chalk from 'chalk'
 import { createServer, ViteDevServer } from '..'
 import { createDebugger, normalizePath } from '../utils'
 import { ModuleNode } from './moduleGraph'
-import chalk from 'chalk'
-import slash from 'slash'
 import { Update } from 'types/hmrPayload'
 import { CLIENT_DIR } from '../constants'
 import { RollupError } from 'rollup'
@@ -43,7 +42,7 @@ export async function handleHMRUpdate(
   const shortFile = getShortName(file, config.root)
 
   if (file === config.configFile || file.endsWith('.env')) {
-    // TODO auto restart server
+    // auto restart server
     debugHmr(`[config change] ${chalk.dim(shortFile)}`)
     config.logger.info(
       chalk.green('config or .env file changed, restarting server...'),
@@ -96,7 +95,7 @@ export async function handleHMRUpdate(
         type: 'full-reload',
         path: config.server.middlewareMode
           ? '*'
-          : '/' + slash(path.relative(config.root, file))
+          : '/' + normalizePath(path.relative(config.root, file))
       })
     } else {
       // loaded but not in the module graph, probably not js
@@ -421,7 +420,7 @@ async function restartServer(server: ViteDevServer) {
     }
   }
   if (!server.config.server.middlewareMode) {
-    await server.listen()
+    await server.listen(undefined, true)
   } else {
     server.config.logger.info('server restarted.', { timestamp: true })
   }

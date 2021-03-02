@@ -85,12 +85,17 @@ export function proxyMiddleware({
         url.startsWith(context)
       ) {
         const [proxy, opts] = proxies[context]
+        const options: HttpProxy.ServerOptions = {}
 
         if (opts.bypass) {
           const bypassResult = opts.bypass(req, res, opts)
           if (typeof bypassResult === 'string') {
             req.url = bypassResult
             debug(`bypass: ${req.url} -> ${bypassResult}`)
+            return next()
+          } else if (typeof bypassResult === 'object') {
+            Object.assign(options, bypassResult)
+            debug(`bypass: ${req.url} use modified opitions: %O`, options)
             return next()
           } else if (bypassResult === false) {
             debug(`bypass: ${req.url} -> 404`)
@@ -102,7 +107,7 @@ export function proxyMiddleware({
         if (opts.rewrite) {
           req.url = opts.rewrite(req.url!)
         }
-        proxy.web(req, res)
+        proxy.web(req, res, options)
         return
       }
     }

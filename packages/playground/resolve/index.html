@@ -21,6 +21,9 @@
 <h2>Resolve /index.*</h2>
 <p class="index">fail</p>
 
+<h2>Resolve dir and file of the same name (should prioritize file)</h2>
+<p class="dir-vs-file">fail</p>
+
 <h2>Resolve file name containing dot</h2>
 <p class="dot">fail</p>
 
@@ -38,6 +41,15 @@
 
 <h2>Inline package</h2>
 <p class="inline-pkg"></p>
+
+<h2>resolve.extensions</h2>
+<p class="custom-ext"></p>
+
+<h2>resolve.mainFields</h2>
+<p class="custom-main-fields"></p>
+
+<h2>resolve.conditions</h2>
+<p class="custom-condition"></p>
 
 <script type="module">
   function text(selector, text) {
@@ -79,6 +91,10 @@
   import { foo } from './util'
   text('.index', foo())
 
+  // implicit dir index vs. file
+  import { file } from './dir'
+  text('.dir-vs-file', file)
+
   // filename with dot
   import { bar } from './util/bar.util'
   text('.dot', bar())
@@ -86,6 +102,15 @@
   // browser field
   import value from 'resolve-browser-field'
   text('.browser', value)
+
+  import { msg as customExtMsg } from './custom-ext'
+  text('.custom-ext', customExtMsg)
+
+  import { msg as customMainMsg } from 'resolve-custom-main-field'
+  text('.custom-main-fields', customMainMsg)
+
+  import { msg as customConditionMsg } from 'resolve-custom-condition'
+  text('.custom-condition', customConditionMsg)
 
   // should be ok to import a file marked with browser: false
   import 'resolve-browser-field/not-browser'

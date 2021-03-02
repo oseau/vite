@@ -3,7 +3,12 @@ import path from 'path'
 import glob from 'fast-glob'
 import { ResolvedConfig } from '..'
 import { Loader, Plugin } from 'esbuild'
-import { KNOWN_ASSET_TYPES, SPECIAL_QUERY_RE } from '../constants'
+import {
+  KNOWN_ASSET_TYPES,
+  JS_TYPES_RE,
+  SPECIAL_QUERY_RE,
+  OPTIMIZABLE_ENTRY_RE
+} from '../constants'
 import {
   createDebugger,
   emptyDir,
@@ -20,12 +25,10 @@ import {
 import { init, parse } from 'es-module-lexer'
 import MagicString from 'magic-string'
 import { transformImportGlob } from '../importGlob'
-import { isCSSRequest } from '../plugins/css'
 import { ensureService } from '../plugins/esbuild'
 
 const debug = createDebugger('vite:deps')
 
-const jsTypesRE = /\.(j|t)sx?$|\.mjs$/
 const htmlTypesRE = /\.(html|vue|svelte)$/
 
 export async function scanImports(
@@ -58,9 +61,12 @@ export async function scanImports(
     entries = await globEntries('**/*.html', config)
   }
 
-  // CSS/Asset entrypoints should not be scanned for dependencies.
+  // Non-supported entry file types and virtual files should not be scanned for
+  // dependencies.
   entries = entries.filter(
-    (entry) => !(isCSSRequest(entry) || config.assetsInclude(entry))
+    (entry) =>
+      (JS_TYPES_RE.test(entry) || htmlTypesRE.test(entry)) &&
+      fs.existsSync(entry)
   )
 
   if (!entries.length) {
@@ -128,7 +134,7 @@ function esbuildScanPlugin(
   const seen = new Map<string, string | undefined>()
 
   const resolve = async (id: string, importer?: string) => {
-    const key = id + importer
+    const key = id + (importer && path.dirname(importer))
     if (seen.has(key)) {
       return seen.get(key)
     }
@@ -186,8 +192,8 @@ function esbuildScanPlugin(
           const langMatch = openTag.match(langRE)
           const lang =
             langMatch && (langMatch[1] || langMatch[2] || langMatch[3])
-          if (lang === 'ts') {
-            loader = 'ts'
+          if (lang === 'ts' || lang === 'tsx' || lang === 'jsx') {
+            loader = lang
           }
           if (srcMatch) {
             const src = srcMatch[1] || srcMatch[2] || srcMatch[3]
@@ -196,15 +202,24 @@ function esbuildScanPlugin(
             js += content + '\n'
           }
         }
-        if (!js.includes(`export default`)) {
-          js += `export default {}`
-        }
 
         if (js.includes('import.meta.glob')) {
-          return transformGlob(js, path).then((contents) => ({
-            loader,
-            contents
-          }))
+          return transformGlob(js, path, config.root, loader).then(
+            (contents) => ({
+              loader,
+              contents
+            })
+          )
+        }
+
+        // <script setup> may contain TLA which is not true TLA but esbuild
+        // will error on it, so replace it with another operator.
+        if (js.includes('await')) {
+          js = js.replace(/\bawait\s/g, 'void ')
+        }
+
+        if (!js.includes(`export default`)) {
+          js += `export default {}`
         }
 
         return {
@@ -233,7 +248,9 @@ function esbuildScanPlugin(
             }
             if (resolved.includes('node_modules') || include?.includes(id)) {
               // dep or fordce included, externalize and stop crawling
-              depImports[id] = resolved
+              if (OPTIMIZABLE_ENTRY_RE.test(resolved)) {
+                depImports[id] = resolved
+              }
               return externalUnlessEntry({ path: id })
             } else {
               // linked package, keep crawling
@@ -288,8 +305,12 @@ function esbuildScanPlugin(
             if (shouldExternalizeDep(resolved, id)) {
               return externalUnlessEntry({ path: id })
             }
+
+            const namespace = htmlTypesRE.test(resolved) ? 'html' : undefined
+
             return {
-              path: path.resolve(cleanUrl(resolved))
+              path: path.resolve(cleanUrl(resolved)),
+              namespace
             }
           } else {
             // resolve failed... probably usupported type
@@ -301,15 +322,22 @@ function esbuildScanPlugin(
       // for jsx/tsx, we need to access the content and check for
       // presence of import.meta.glob, since it results in import relationships
       // but isn't crawled by esbuild.
-      build.onLoad({ filter: jsTypesRE }, ({ path: id }) => {
+      build.onLoad({ filter: JS_TYPES_RE }, ({ path: id }) => {
         let ext = path.extname(id).slice(1)
         if (ext === 'mjs') ext = 'js'
-        const contents = fs.readFileSync(id, 'utf-8')
+
+        let contents = fs.readFileSync(id, 'utf-8')
+        if (ext.endsWith('x') && config.esbuild && config.esbuild.jsxInject) {
+          contents = config.esbuild.jsxInject + `\n` + contents
+        }
+
         if (contents.includes('import.meta.glob')) {
-          return transformGlob(contents, id).then((contents) => ({
-            loader: ext as Loader,
-            contents
-          }))
+          return transformGlob(contents, id, config.root, ext as Loader).then(
+            (contents) => ({
+              loader: ext as Loader,
+              contents
+            })
+          )
         }
         return {
           loader: ext as Loader,
@@ -320,7 +348,17 @@ function esbuildScanPlugin(
   }
 }
 
-async function transformGlob(source: string, importer: string) {
+async function transformGlob(
+  source: string,
+  importer: string,
+  root: string,
+  loader: Loader
+) {
+  // transform the content first since es-module-lexer can't handle non-js
+  if (loader !== 'js') {
+    source = (await (await ensureService()).transform(source, { loader })).code
+  }
+
   await init
   const imports = parse(source)[0]
   const s = new MagicString(source)
@@ -333,7 +371,8 @@ async function transformGlob(source: string, importer: string) {
       source,
       start,
       normalizePath(importer),
-      index
+      index,
+      root
     )
     s.prepend(importsString)
     s.overwrite(expStart, endIndex, exp)
@@ -341,7 +380,7 @@ async function transformGlob(source: string, importer: string) {
   return s.toString()
 }
 
-export function shouldExternalizeDep(resolvedId: string, rawId?: string) {
+export function shouldExternalizeDep(resolvedId: string, rawId: string) {
   // not a valid file path
   if (!path.isAbsolute(resolvedId)) {
     return true
@@ -350,8 +389,8 @@ export function shouldExternalizeDep(resolvedId: string, rawId?: string) {
   if (resolvedId === rawId || resolvedId.includes('\0')) {
     return true
   }
-  // resovled is not a js type
-  if (!jsTypesRE.test(resolvedId)) {
+  // resovled is not a scannable type
+  if (!JS_TYPES_RE.test(resolvedId) && !htmlTypesRE.test(resolvedId)) {
     return true
   }
 }

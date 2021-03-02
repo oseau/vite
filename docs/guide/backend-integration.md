@@ -35,6 +35,18 @@ If you want to serve the HTML using a traditional backend (e.g. Rails, Laravel) 
 
    Also make sure the server is configured to serve static assets in the Vite working directory, otherwise assets such as images won't be loaded properly.
 
+   Note if you are using React with `@vitejs/plugin-react-refresh`, you'll also need to add this before the above scripts, since the plugin is not able to modify the HTML you are serving:
+
+   ```html
+   <script type="module">
+     import RefreshRuntime from "http://localhost:3000/@react-refresh"
+     RefreshRuntime.injectIntoGlobalHook(window) 
+     window.$RefreshReg$ = () => {}
+     window.$RefreshSig$ = () => (type) => type
+     window.__vite_plugin_react_preamble_installed__ = true
+   </script>
+   ```
+
 3. For production: after running `vite build`, a `manifest.json` file will be generated alongside other asset files. An example manifest file looks like this:
 
    ```json
@@ -44,7 +56,7 @@ If you want to serve the HTML using a traditional backend (e.g. Rails, Laravel) 
        "src": "main.js",
        "isEntry": true,
        "dynamicImports": ["views/foo.js"],
-       "css": "assets/main.b82dbe22.css",
+       "css": ["assets/main.b82dbe22.css"],
        "assets": ["assets/asset.0ab0f9cd.png"]
      },
      "views/foo.js": {

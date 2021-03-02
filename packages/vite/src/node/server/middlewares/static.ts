@@ -36,12 +36,9 @@ export function serveStaticMiddleware(
       return next()
     }
 
-    // #1426
-    url = req.url = decodeURI(url)
-
     // apply aliases to static requests as well
     let redirected: string | undefined
-    for (const { find, replacement } of config.alias) {
+    for (const { find, replacement } of config.resolve.alias) {
       const matches =
         typeof find === 'string' ? url.startsWith(find) : find.test(url)
       if (matches) {
@@ -62,18 +59,18 @@ export function serveStaticMiddleware(
 }
 
 export function serveRawFsMiddleware(): Connect.NextHandleFunction {
-  const fsRoot =
-    os.platform() == 'win32' ? process.cwd().split(path.sep)[0] + '/' : '/'
-  const serveFromRoot = sirv(fsRoot, sirvOptions)
+  const isWin = os.platform() === 'win32'
+  const serveFromRoot = sirv('/', sirvOptions)
 
   return (req, res, next) => {
-    const url = req.url!
+    let url = req.url!
     // In some cases (e.g. linked monorepos) files outside of root will
     // reference assets that are also out of served root. In such cases
     // the paths are rewritten to `/@fs/` prefixed paths and must be served by
     // searching based from fs root.
     if (url.startsWith(FS_PREFIX)) {
-      req.url = decodeURI(url.slice(FS_PREFIX.length))
+      url = url.slice(FS_PREFIX.length)
+      if (isWin) url = url.replace(/^[A-Z]:/i, '')
       serveFromRoot(req, res, next)
     } else {
       next()

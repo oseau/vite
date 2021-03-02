@@ -4,11 +4,20 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import { parse as parseUrl } from 'url'
-import slash from 'slash'
-import { FS_PREFIX, SUPPORTED_EXTS } from './constants'
+import { FS_PREFIX, DEFAULT_EXTENSIONS, VALID_ID_PREFIX } from './constants'
 import resolve from 'resolve'
 import builtins from 'builtin-modules'
 import { FSWatcher } from 'chokidar'
+
+export function slash(p: string): string {
+  return p.replace(/\\/g, '/')
+}
+
+// Strip valid id prefix. This is preprended to resolved Ids that are
+// not valid browser import specifiers by the importAnalysis plugin.
+export function unwrapId(id: string): string {
+  return id.startsWith(VALID_ID_PREFIX) ? id.slice(VALID_ID_PREFIX.length) : id
+}
 
 export const flattenId = (id: string) => id.replace(/[\/\.]/g, '_')
 
@@ -29,7 +38,7 @@ const ssrExtensions = ['.js', '.json', '.node']
 export function resolveFrom(id: string, basedir: string, ssr = false) {
   return resolve.sync(id, {
     basedir,
-    extensions: ssr ? ssrExtensions : SUPPORTED_EXTS,
+    extensions: ssr ? ssrExtensions : DEFAULT_EXTENSIONS,
     // necessary to work with pnpm
     preserveSymlinks: isRunningWithYarnPnp || false
   })
@@ -342,4 +351,39 @@ export function ensureWatchedFile(
     // resolve file to normalized system path
     watcher.add(path.resolve(file))
   }
+}
+
+interface ImageCandidate {
+  url: string
+  descriptor: string
+}
+const escapedSpaceCharacters = /( |\\t|\\n|\\f|\\r)+/g
+export async function processSrcSet(
+  srcs: string,
+  replacer: (arg: ImageCandidate) => Promise<string>
+) {
+  const imageCandidates: ImageCandidate[] = srcs.split(',').map((s) => {
+    const [url, descriptor] = s
+      .replace(escapedSpaceCharacters, ' ')
+      .trim()
+      .split(' ', 2)
+    return { url, descriptor }
+  })
+
+  const ret = await Promise.all(
+    imageCandidates.map(async ({ url, descriptor }) => {
+      return {
+        url: await replacer({ url, descriptor }),
+        descriptor
+      }
+    })
+  )
+
+  const url = ret.reduce((prev, { url, descriptor }, index) => {
+    descriptor = descriptor || ''
+    return (prev +=
+      url + ` ${descriptor}${index === ret.length - 1 ? '' : ', '}`)
+  }, '')
+
+  return url
 }

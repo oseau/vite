@@ -1,14 +1,8 @@
 # Features
 
-At the very basic level, developing using Vite is not that much different from using a static file server. However, Vite provides many enhancements over native ESM imports to support
+At the very basic level, developing using Vite is not that much different from using a static file server. However, Vite provides many enhancements over native ESM imports to support various features that are typically seen in bundler-based setups.
 
-## Hot Module Replacement
-
-Vite provides an [HMR API](./api-hmr) over native ESM. Frameworks with HMR capabilities can leverage the API to provide instant, precise updates without reloading the page or blowing away application state. Vite provides first-party HMR integrations for [Vue Single File Components](https://github.com/vitejs/vite/tree/main/packages/plugin-vue) and [React Fast Refresh](https://github.com/vitejs/vite/tree/main/packages/plugin-react-refresh). There are also official integrations for Preact via [@prefresh/vite](https://github.com/JoviDeCroock/prefresh/tree/main/packages/vite).
-
-Note you don't need to manually set these up - when you [create an app via `@vitejs/create-app`](./), the selected templates would have these pre-configured for you already.
-
-## NPM Dependency Resolving
+## NPM Dependency Resolving and Pre-Bundling
 
 Native ES imports do not support bare module imports like the following:
 
@@ -16,11 +10,21 @@ Native ES imports do not support bare module imports like the following:
 import { someMethod } from 'my-dep'
 ```
 
-The above will throw an error in the browser. Vite detects such bare module imports in all served `.js` files and rewrites them to resolved paths like `/node_modules/my-dep/dist/my-dep.js?v=1.0.0` so that the browser can handle them properly.
+The above will throw an error in the browser. Vite will detect such bare module imports in all served source files and perform the following:
 
-**Dependency Caching**
+1. [Pre-bundle](./dep-pre-bundling) them to improve page loading speed and convert CommonJS / UMD modules to ESM. The pre-bundling step is performed with [esbuild](http://esbuild.github.io/) and makes Vite's cold start time significantly faster than any JavaScript-based bundler.
 
-Resolved dependency requests are strongly cached with headers `max-age=31536000,immutable` to improve page reload performance during dev. Once cached, these requests will never hit the dev server again. They are auto invalidated by the appended version query if a different version is installed. If you made manual local edits to your dependencies, you can temporarily disable cache via your browser devtools and reload the page.
+2. Rewrite the imports to valid URLs like `/node_modules/.vite/my-dep.js?v=f3sf2ebd` so that the browser can import them properly.
+
+**Dependencies are Strongly Cached**
+
+Vite caches dependency requests via HTTP headers, so if you wish to locally edit/debug a dependency, follow the steps [here](./dep-pre-bundling#browser-cache).
+
+## Hot Module Replacement
+
+Vite provides an [HMR API](./api-hmr) over native ESM. Frameworks with HMR capabilities can leverage the API to provide instant, precise updates without reloading the page or blowing away application state. Vite provides first-party HMR integrations for [Vue Single File Components](https://github.com/vitejs/vite/tree/main/packages/plugin-vue) and [React Fast Refresh](https://github.com/vitejs/vite/tree/main/packages/plugin-react-refresh). There are also official integrations for Preact via [@prefresh/vite](https://github.com/JoviDeCroock/prefresh/tree/main/packages/vite).
+
+Note you don't need to manually set these up - when you [create an app via `@vitejs/create-app`](./), the selected templates would have these pre-configured for you already.
 
 ## TypeScript
 
@@ -119,7 +123,15 @@ import classes from './example.module.css'
 document.getElementById('foo').className = classes.red
 ```
 
-Note that the CSS modules `localsConvention` defaults to `camelCaseOnly` - i.e. a class named `.foo-bar` will be exposed as `classes.fooBar`. CSS modules behavior can be configured via the [`css.modules` option](/config/#css-modules).
+CSS modules behavior can be configured via the [`css.modules` option](/config/#css-modules).
+
+If `css.modules.localsConvention` is set to enable camelCase locals (e.g. `localsConvention: 'camelCaseOnly'`), you can also use named imports:
+
+```js
+// .apply-color -> applyColor
+import { applyColor } from './example.module.css'
+document.getElementById('foo').className = applyColor
+```
 
 ### CSS Pre-processors
 
@@ -146,12 +158,7 @@ Vite improves `@import` resolving for Sass and Less so that Vite aliases are als
 
 You can also use CSS modules combined with pre-processors by prepending `.module` to the file extension, for example `style.module.scss`.
 
-## Asset Handling
-
-- Related: [Public Base Path](./build#public-base-path)
-- Related: [`assetsInclude` config option](/config/#assetsinclude)
-
-### URL Imports
+## Static Assets
 
 Importing a static asset will return the resolved public URL when it is served:
 
@@ -160,41 +167,29 @@ import imgUrl from './img.png'
 document.getElementById('hero-img').src = imgUrl
 ```
 
-The behavior is similar to webpack's `file-loader`. The difference is that the import can be either using absolute public paths (based on project root during dev) or relative paths.
-
-- `url()` references in CSS are handled the same way.
-
-- If using the Vue plugin, asset references in Vue SFC templates are automatically converted into imports.
-
-- Common image, media, and font filetypes are detected as assets automatically. You can extend the internal list using the [`assetsInclude` option](/config/#assetsinclude).
-
-- Referenced assets are included as part of the build assets graph, will get hashed file names, and can be processed by plugins for optimization.
-
-- Assets smaller in bytes than the [`assetsInlineLimit` option](/config/#assetsinlinelimit) will be inlined as base64 data URLs.
-
-- Assets that are not included in the internal list or in `assetsInclude`, can be manually imported as an URL using the `?url` suffix. This is useful, for example, to import [Houdini Paint Worklets](https://houdini.how/usage).
+Special queries can modify how assets are loaded:
 
 ```js
-import workletURL from "extra-scalloped-border/worklet.js?url";
-CSS.paintWorklet.addModule(workletURL);
+// Explicitly load assets as URL
+import assetAsURL from './asset.js?url'
 ```
 
-### The `public` Directory
+```js
+// Load assets as strings
+import assetAsString from './shader.glsl?raw'
+```
 
-If you have assets that are:
+```js
+// Load Web Workers
+import Worker from './worker.js?worker'
+```
 
-- Never referenced in source code (e.g. `robots.txt`)
-- Must retain the exact same file name (without hashing)
-- ...or you simply don't want to have to import an asset first just to get its URL
+```js
+// Web Workers inlined as base64 strings at build time
+import InlineWorker from './worker.js?worker&inline'
+```
 
-Then you can place the asset in a special `public` directory under your project root. Assets in this directory will be served at root path `/` during dev, and copied to the root of the dist directory as-is.
-
-The directory defaults to `<root>/public`, but can be configured via the [`publicDir` option](/config/#publicdir).
-
-Note that:
-
-- You should always reference `public` assets using root absolute path - for example, `public/icon.png` should be referenced in source code as `/icon.png`.
-- Assets in `public` cannot be imported from JavaScript.
+More details in [Static Asset Handling](./assets).
 
 ## JSON
 
@@ -208,8 +203,6 @@ import { field } from './example.json'
 ```
 
 ## Glob Import
-
-> Requires ^2.0.0-beta.17
 
 Vite supports importing multiple modules from the file system via the special `import.meta.glob` function:
 
@@ -258,7 +251,7 @@ const modules = {
 Note that:
 
 - This is a Vite-only feature and is not a web or ES standard.
-- The glob patterns must be relative and start with `.`.
+- The glob patterns are treated like import specifiers: they must be either relative (start with `./`) or absolute (start with `/`, resolved relative to project root). Globbing from dependencies is not supported.
 - The glob matching is done via `fast-glob` - check out its documentation for [supported glob patterns](https://github.com/mrmlnc/fast-glob#pattern-syntax).
 
 ## Web Assembly
@@ -331,7 +324,7 @@ Vite automatically generates `<link rel="modulepreload">` directives for entry c
 
 In real world applications, Rollup often generates "common" chunks - code that is shared between two or more other chunks. Combined with dynamic imports, it is quite common to have the following scenario:
 
-![graph](/graph.png)
+![graph](/images/graph.png)
 
 In the non-optimized scenarios, when async chunk `A` is imported, the browser will have to request and parse `A` before it can figure out that it also needs the common chunk `C`. This results in an extra network roundtrip:
 

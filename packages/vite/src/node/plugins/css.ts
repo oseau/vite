@@ -8,7 +8,8 @@ import {
   generateCodeFrame,
   isDataUrl,
   isObject,
-  normalizePath
+  normalizePath,
+  processSrcSet
 } from '../utils'
 import { Plugin } from '../plugin'
 import { ResolvedConfig } from '../config'
@@ -16,29 +17,24 @@ import postcssrc from 'postcss-load-config'
 import {
   NormalizedOutputOptions,
   OutputChunk,
-  PluginContext,
   RenderedChunk,
   RollupError,
   SourceMap
 } from 'rollup'
 import { dataToEsm } from '@rollup/pluginutils'
 import chalk from 'chalk'
-import { CLIENT_PUBLIC_PATH, FS_PREFIX } from '../constants'
-import {
-  ProcessOptions,
-  Result,
-  Plugin as PostcssPlugin,
-  PluginCreator
-} from 'postcss'
+import { CLIENT_PUBLIC_PATH } from '../constants'
 import { ResolveFn, ViteDevServer } from '../'
-import { assetUrlRE, urlToBuiltUrl } from './asset'
+import {
+  getAssetFilename,
+  assetUrlRE,
+  registerAssetToChunk,
+  fileToUrl,
+  checkPublicFile
+} from './asset'
 import MagicString from 'magic-string'
-import type {
-  ImporterReturnType,
-  Options as SassOptions,
-  Result as SassResult,
-  render as sassRender
-} from 'sass'
+import * as Postcss from 'postcss'
+import * as Sass from 'sass'
 import type Less from 'less'
 
 // const debug = createDebugger('vite:css')
@@ -51,12 +47,17 @@ export interface CSSOptions {
   preprocessorOptions?: Record<string, any>
   postcss?:
     | string
-    | (ProcessOptions & {
-        plugins?: PostcssPlugin[]
+    | (Postcss.ProcessOptions & {
+        plugins?: Postcss.Plugin[]
       })
 }
 
 export interface CSSModulesOptions {
+  getJSON?: (
+    cssFileName: string,
+    json: Record<string, string>,
+    outputFileName: string
+  ) => void
   scopeBehaviour?: 'global' | 'local'
   globalModulePaths?: string[]
   generateScopedName?:
@@ -64,15 +65,21 @@ export interface CSSModulesOptions {
     | ((name: string, filename: string, css: string) => string)
   hashPrefix?: string
   /**
-   * default: 'camelCaseOnly'
+   * default: 'camelCase'
    */
-  localsConvention?: 'camelCase' | 'camelCaseOnly' | 'dashes' | 'dashesOnly'
+  localsConvention?:
+    | 'camelCase'
+    | 'camelCaseOnly'
+    | 'dashes'
+    | 'dashesOnly'
+    | null
 }
 
 const cssLangs = `\\.(css|less|sass|scss|styl|stylus|postcss)($|\\?)`
 const cssLangRE = new RegExp(cssLangs)
 const cssModuleRE = new RegExp(`\\.module${cssLangs}`)
 const directRequestRE = /(\?|&)direct\b/
+const commjsProxyRE = /\?commonjs-proxy/
 
 export const isCSSRequest = (request: string) =>
   cssLangRE.test(request) && !directRequestRE.test(request)
@@ -98,7 +105,12 @@ export function cssPlugin(config: ResolvedConfig): Plugin {
   const moduleCache = new Map<string, Record<string, string>>()
   cssModulesCache.set(config, moduleCache)
 
-  const resolvers = createCSSResolvers(config)
+  const resolveUrl = config.createResolver({
+    preferRelative: true,
+    tryIndex: false,
+    extensions: []
+  })
+  const atImportResolvers = createCSSResolvers(config)
 
   return {
     name: 'vite:css',
@@ -108,35 +120,42 @@ export function cssPlugin(config: ResolvedConfig): Plugin {
     },
 
     async transform(raw, id) {
-      if (!cssLangRE.test(id)) {
+      if (!cssLangRE.test(id) || commjsProxyRE.test(id)) {
         return
       }
 
-      const urlReplacer: CssUrlReplacer = server
-        ? (url, importer) => {
-            let replaced: string
-            if (url.startsWith('/')) {
-              replaced = url
-            } else {
-              const filePath = normalizePath(
-                path.resolve(path.dirname(importer || id), url)
-              )
-              replaced = filePath.startsWith(config.root)
-                ? filePath.slice(config.root.length)
-                : `${FS_PREFIX}${filePath}`
-            }
-            return path.posix.join(config.base, replaced)
-          }
-        : (url, importer) => {
-            return urlToBuiltUrl(url, importer || id, config, this)
-          }
+      const urlReplacer: CssUrlReplacer = async (url, importer) => {
+        if (checkPublicFile(url, config)) {
+          return config.base + url.slice(1)
+        }
+        const resolved = await resolveUrl(url, importer)
+        if (resolved) {
+          return fileToUrl(resolved, config, this)
+        }
+        return url
+      }
+
+      // const urlReplacer: CssUrlReplacer = server
+      //   ? (url, importer) => {
+      //       if (url.startsWith('/')) {
+      //         return config.base + url.slice(1)
+      //       } else {
+      //         const filePath = normalizePath(
+      //           path.resolve(path.dirname(importer || id), url)
+      //         )
+      //         return fileToDevUrl(filePath, config)
+      //       }
+      //     }
+      //   : (url, importer) => {
+      //       return urlToBuiltUrl(url, importer || id, config, this)
+      //     }
 
       const { code: css, modules, deps } = await compileCSS(
         id,
         raw,
         config,
         urlReplacer,
-        resolvers
+        atImportResolvers
       )
       if (modules) {
         moduleCache.set(id, modules)
@@ -198,7 +217,7 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
     name: 'vite:css-post',
 
     transform(css, id, ssr) {
-      if (!cssLangRE.test(id)) {
+      if (!cssLangRE.test(id) || commjsProxyRE.test(id)) {
         return
       }
 
@@ -247,7 +266,11 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
       let isPureCssChunk = true
       const ids = Object.keys(chunk.modules)
       for (const id of ids) {
-        if (!isCSSRequest(id) || cssModuleRE.test(id)) {
+        if (
+          !isCSSRequest(id) ||
+          cssModuleRE.test(id) ||
+          commjsProxyRE.test(id)
+        ) {
           isPureCssChunk = false
         }
         if (styles.has(id)) {
@@ -259,13 +282,53 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
         return null
       }
 
+      // resolve asset URL placeholders to their built file URLs and perform
+      // minification if necessary
+      const processChunkCSS = async (
+        css: string,
+        {
+          inlined,
+          minify
+        }: {
+          inlined: boolean
+          minify: boolean
+        }
+      ) => {
+        // replace asset url references with resolved url.
+        const isRelativeBase = config.base === '' || config.base.startsWith('.')
+        css = css.replace(assetUrlRE, (_, fileHash, postfix = '') => {
+          const filename = getAssetFilename(fileHash, config) + postfix
+          registerAssetToChunk(chunk, filename)
+          if (!isRelativeBase || inlined) {
+            // absoulte base or relative base but inlined (injected as style tag into
+            // index.html) use the base as-is
+            return config.base + filename
+          } else {
+            // relative base + extracted CSS - asset file will be in the same dir
+            return `./${path.posix.basename(filename)}`
+          }
+        })
+        // only external @imports should exist at this point - and they need to
+        // be hoisted to the top of the CSS chunk per spec (#1845)
+        if (css.includes('@import')) {
+          css = await hoistAtImports(css)
+        }
+        if (minify && config.build.minify) {
+          css = await minifyCSS(css, config)
+        }
+        return css
+      }
+
       if (config.build.cssCodeSplit) {
         if (isPureCssChunk) {
           // this is a shared CSS-only chunk that is empty.
           pureCssChunks.add(chunk.fileName)
         }
         if (opts.format === 'es') {
-          chunkCSS = await processChunkCSS(chunkCSS, config, this, false)
+          chunkCSS = await processChunkCSS(chunkCSS, {
+            inlined: false,
+            minify: true
+          })
           // emit corresponding css file
           const fileHandle = this.emitFile({
             name: chunk.name + '.css',
@@ -278,7 +341,10 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
           )
         } else if (!config.build.ssr) {
           // legacy build, inline css
-          chunkCSS = await processChunkCSS(chunkCSS, config, this, true)
+          chunkCSS = await processChunkCSS(chunkCSS, {
+            inlined: true,
+            minify: true
+          })
           const style = `__vite_style__`
           const injectCode =
             `var ${style} = document.createElement('style');` +
@@ -296,7 +362,11 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
           }
         }
       } else {
-        chunkCSS = await processChunkCSS(chunkCSS, config, this, false, false)
+        // non-split extracted CSS will be minified togethter
+        chunkCSS = await processChunkCSS(chunkCSS, {
+          inlined: false,
+          minify: false
+        })
         outputToExtractedCSSMap.set(
           opts,
           (outputToExtractedCSSMap.get(opts) || '') + chunkCSS
@@ -368,13 +438,13 @@ export function cssPostPlugin(config: ResolvedConfig): Plugin {
   }
 }
 
-interface CSSResolvers {
+interface CSSAtImportResolvers {
   css: ResolveFn
   sass: ResolveFn
   less: ResolveFn
 }
 
-function createCSSResolvers(config: ResolvedConfig): CSSResolvers {
+function createCSSResolvers(config: ResolvedConfig): CSSAtImportResolvers {
   let cssResolve: ResolveFn | undefined
   let sassResolve: ResolveFn | undefined
   let lessResolve: ResolveFn | undefined
@@ -384,8 +454,9 @@ function createCSSResolvers(config: ResolvedConfig): CSSResolvers {
         cssResolve ||
         (cssResolve = config.createResolver({
           extensions: ['.css'],
+          mainFields: ['style'],
           tryIndex: false,
-          relativeFirst: true
+          preferRelative: true
         }))
       )
     },
@@ -395,8 +466,10 @@ function createCSSResolvers(config: ResolvedConfig): CSSResolvers {
         sassResolve ||
         (sassResolve = config.createResolver({
           extensions: ['.scss', '.sass', '.css'],
-          tryIndex: '_index',
-          relativeFirst: true
+          mainFields: ['sass', 'style'],
+          tryIndex: true,
+          tryPrefix: '_',
+          preferRelative: true
         }))
       )
     },
@@ -406,8 +479,9 @@ function createCSSResolvers(config: ResolvedConfig): CSSResolvers {
         lessResolve ||
         (lessResolve = config.createResolver({
           extensions: ['.less', '.css'],
+          mainFields: ['less', 'style'],
           tryIndex: false,
-          relativeFirst: true
+          preferRelative: true
         }))
       )
     }
@@ -419,11 +493,11 @@ async function compileCSS(
   code: string,
   config: ResolvedConfig,
   urlReplacer: CssUrlReplacer,
-  resolvers: CSSResolvers
+  atImportResolvers: CSSAtImportResolvers
 ): Promise<{
   code: string
   map?: SourceMap
-  ast?: Result
+  ast?: Postcss.Result
   modules?: Record<string, string>
   deps?: Set<string>
 }> {
@@ -432,7 +506,7 @@ async function compileCSS(
   // although at serve time it can work without processing, we do need to
   // crawl them in order to register watch dependencies.
   const needInlineImport = code.includes('@import')
-  const hasUrl = cssUrlRE.test(code)
+  const hasUrl = cssUrlRE.test(code) || cssImageSetRE.test(code)
   const postcssConfig = await resolvePostcssConfig(config)
   const lang = id.match(cssLangRE)?.[1]
 
@@ -474,7 +548,12 @@ async function compileCSS(
     }
     // important: set this for relative import resolving
     opts.filename = cleanUrl(id)
-    const preprocessResult = await preProcessor(code, opts, resolvers)
+    const preprocessResult = await preProcessor(
+      code,
+      config.root,
+      opts,
+      atImportResolvers
+    )
     if (preprocessResult.errors.length) {
       throw preprocessResult.errors[0]
     }
@@ -500,7 +579,10 @@ async function compileCSS(
     postcssPlugins.unshift(
       (await import('postcss-import')).default({
         async resolve(id, basedir) {
-          const resolved = await resolvers.css(id, path.join(basedir, '*'))
+          const resolved = await atImportResolvers.css(
+            id,
+            path.join(basedir, '*')
+          )
           if (resolved) {
             return path.resolve(resolved)
           }
@@ -512,16 +594,22 @@ async function compileCSS(
   postcssPlugins.push(
     UrlRewritePostcssPlugin({
       replacer: urlReplacer
-    }) as PostcssPlugin
+    }) as Postcss.Plugin
   )
 
   if (isModule) {
     postcssPlugins.unshift(
       (await import('postcss-modules')).default({
-        localsConvention: 'camelCaseOnly',
         ...modulesOptions,
-        getJSON(_: string, _modules: Record<string, string>) {
+        getJSON(
+          cssFileName: string,
+          _modules: Record<string, string>,
+          outputFileName: string
+        ) {
           modules = _modules
+          if (modulesOptions && typeof modulesOptions.getJSON === 'function') {
+            modulesOptions.getJSON(cssFileName, _modules, outputFileName)
+          }
         }
       })
     )
@@ -574,8 +662,8 @@ async function compileCSS(
 }
 
 interface PostCSSConfigResult {
-  options: ProcessOptions
-  plugins: PostcssPlugin[]
+  options: Postcss.ProcessOptions
+  plugins: Postcss.Plugin[]
 }
 
 let cachedPostcssConfig: PostCSSConfigResult | null | undefined
@@ -601,6 +689,7 @@ async function resolvePostcssConfig(
   try {
     const searchPath =
       typeof inlineOptions === 'string' ? inlineOptions : config.root
+    // @ts-ignore
     return (cachedPostcssConfig = await postcssrc({}, searchPath))
   } catch (e) {
     if (!/No PostCSS Config found/.test(e.message)) {
@@ -615,8 +704,9 @@ type CssUrlReplacer = (
   importer?: string
 ) => string | Promise<string>
 const cssUrlRE = /url\(\s*('[^']+'|"[^"]+"|[^'")]+)\s*\)/
+const cssImageSetRE = /image-set\(([^)]+)\)/
 
-const UrlRewritePostcssPlugin: PluginCreator<{
+const UrlRewritePostcssPlugin: Postcss.PluginCreator<{
   replacer: CssUrlReplacer
 }> = (opts) => {
   if (!opts) {
@@ -628,13 +718,16 @@ const UrlRewritePostcssPlugin: PluginCreator<{
     Once(root) {
       const promises: Promise<void>[] = []
       root.walkDecls((decl) => {
-        if (cssUrlRE.test(decl.value)) {
+        const isCssUrl = cssUrlRE.test(decl.value)
+        const isCssImageSet = cssImageSetRE.test(decl.value)
+        if (isCssUrl || isCssImageSet) {
           const replacerForDecl = (rawUrl: string) => {
             const importer = decl.source?.input.file
             return opts.replacer(rawUrl, importer)
           }
+          const rewriterToUse = isCssUrl ? rewriteCssUrls : rewriteCssImageSet
           promises.push(
-            rewriteCssUrls(decl.value, replacerForDecl).then((url) => {
+            rewriterToUse(decl.value, replacerForDecl).then((url) => {
               decl.value = url
             })
           )
@@ -654,43 +747,38 @@ function rewriteCssUrls(
 ): Promise<string> {
   return asyncReplace(css, cssUrlRE, async (match) => {
     let [matched, rawUrl] = match
-    let wrap = ''
-    const first = rawUrl[0]
-    if (first === `"` || first === `'`) {
-      wrap = first
-      rawUrl = rawUrl.slice(1, -1)
-    }
-    if (isExternalUrl(rawUrl) || isDataUrl(rawUrl) || rawUrl.startsWith('#')) {
-      return matched
-    }
-    return `url(${wrap}${await replacer(rawUrl)}${wrap})`
+    return await doUrlReplace(rawUrl, matched, replacer)
   })
 }
 
-async function processChunkCSS(
+function rewriteCssImageSet(
   css: string,
-  config: ResolvedConfig,
-  pluginCtx: PluginContext,
-  isInlined: boolean,
-  minify = true
+  replacer: CssUrlReplacer
 ): Promise<string> {
-  // replace asset url references with resolved url.
-  const isRelativeBase = config.base === '' || config.base.startsWith('.')
-  css = css.replace(assetUrlRE, (_, fileId, postfix = '') => {
-    const filename = pluginCtx.getFileName(fileId) + postfix
-    if (!isRelativeBase || isInlined) {
-      // absoulte base or relative base but inlined (injected as style tag into
-      // index.html) use the base as-is
-      return config.base + filename
-    } else {
-      // relative base + extracted CSS - asset file will be in the same dir
-      return `./${path.posix.basename(filename)}`
-    }
+  return asyncReplace(css, cssImageSetRE, async (match) => {
+    let [matched, rawUrl] = match
+    const url = await processSrcSet(rawUrl, ({ url }) =>
+      doUrlReplace(url, matched, replacer)
+    )
+    return `image-set(${url})`
   })
-  if (minify && config.build.minify) {
-    css = await minifyCSS(css, config)
+}
+async function doUrlReplace(
+  rawUrl: string,
+  matched: string,
+  replacer: CssUrlReplacer
+) {
+  let wrap = ''
+  const first = rawUrl[0]
+  if (first === `"` || first === `'`) {
+    wrap = first
+    rawUrl = rawUrl.slice(1, -1)
   }
-  return css
+  if (isExternalUrl(rawUrl) || isDataUrl(rawUrl) || rawUrl.startsWith('#')) {
+    return matched
+  }
+
+  return `url(${wrap}${await replacer(rawUrl)}${wrap})`
 }
 
 let CleanCSS: any
@@ -704,31 +792,64 @@ async function minifyCSS(css: string, config: ResolvedConfig) {
 
   if (res.errors && res.errors.length) {
     config.logger.error(chalk.red(`error when minifying css:\n${res.errors}`))
-    // TODO format this
     throw res.errors[0]
   }
 
-  if (res.warnings && res.warnings.length) {
+  // do not warn on remote @imports
+  const warnings =
+    res.warnings &&
+    res.warnings.filter((m: string) => !m.includes('remote @import'))
+  if (warnings && warnings.length) {
     config.logger.warn(
-      chalk.yellow(`warnings when minifying css:\n${res.warnings}`)
+      chalk.yellow(`warnings when minifying css:\n${warnings.join('\n')}`)
     )
   }
 
   return res.styles
 }
 
+// #1845
+// CSS @import can only appear at top of the file. We need to hoist all @import
+// to top when multiple files are concatenated.
+async function hoistAtImports(css: string) {
+  const postcss = await import('postcss')
+  return (await postcss.default([AtImportHoistPlugin]).process(css)).css
+}
+
+const AtImportHoistPlugin: Postcss.PluginCreator<any> = () => {
+  return {
+    postcssPlugin: 'vite-hoist-at-imports',
+    Once(root) {
+      const imports: Postcss.AtRule[] = []
+      root.walkAtRules((rule) => {
+        if (rule.name === 'import') {
+          // record in reverse so that can simply prepend to preserve order
+          imports.unshift(rule)
+        }
+      })
+      imports.forEach((i) => root.prepend(i))
+    }
+  }
+}
+AtImportHoistPlugin.postcss = true
+
 // Preprocessor support. This logic is largely replicated from @vue/compiler-sfc
 
 type PreprocessLang = 'less' | 'sass' | 'scss' | 'styl' | 'stylus'
 
+type PreprocessorAdditionalData =
+  | string
+  | ((source: string, filename: string) => string | Promise<string>)
+
 type StylePreprocessor = (
   source: string,
+  root: string,
   options: {
     [key: string]: any
-    additionalData?: string | ((source: string, filename: string) => string)
+    additionalData?: PreprocessorAdditionalData
     filename: string
   },
-  resolvers: CSSResolvers
+  resolvers: CSSAtImportResolvers
 ) => StylePreprocessorResults | Promise<StylePreprocessorResults>
 
 export interface StylePreprocessorResults {
@@ -738,9 +859,15 @@ export interface StylePreprocessorResults {
   deps: string[]
 }
 
-function loadPreprocessor(lang: PreprocessLang) {
+const loadedPreprocessors: Partial<Record<PreprocessLang, any>> = {}
+
+function loadPreprocessor(lang: PreprocessLang, root: string) {
+  if (lang in loadedPreprocessors) {
+    return loadedPreprocessors[lang]
+  }
   try {
-    return require(lang)
+    const resolved = require.resolve(lang, { paths: [root] })
+    return (loadedPreprocessors[lang] = require(resolved))
   } catch (e) {
     throw new Error(
       `Preprocessor dependency "${lang}" not found. Did you install it?`
@@ -749,11 +876,11 @@ function loadPreprocessor(lang: PreprocessLang) {
 }
 
 // .scss/.sass processor
-const scss: StylePreprocessor = async (source, options, resolvers) => {
-  const render = loadPreprocessor('sass').render as typeof sassRender
-  const finalOptions: SassOptions = {
+const scss: StylePreprocessor = async (source, root, options, resolvers) => {
+  const render = loadPreprocessor('sass', root).render as typeof Sass.render
+  const finalOptions: Sass.Options = {
     ...options,
-    data: getSource(source, options.filename, options.additionalData),
+    data: await getSource(source, options.filename, options.additionalData),
     file: options.filename,
     outFile: options.filename,
     importer(url, importer, done) {
@@ -768,7 +895,7 @@ const scss: StylePreprocessor = async (source, options, resolvers) => {
   }
 
   try {
-    const result = await new Promise<SassResult>((resolve, reject) => {
+    const result = await new Promise<Sass.Result>((resolve, reject) => {
       render(finalOptions, (err, res) => {
         if (err) {
           reject(err)
@@ -792,9 +919,10 @@ const scss: StylePreprocessor = async (source, options, resolvers) => {
   }
 }
 
-const sass: StylePreprocessor = (source, options, aliasResolver) =>
+const sass: StylePreprocessor = (source, root, options, aliasResolver) =>
   scss(
     source,
+    root,
     {
       ...options,
       indentedSyntax: true
@@ -809,7 +937,7 @@ const sass: StylePreprocessor = (source, options, aliasResolver) =>
 async function rebaseUrls(
   file: string,
   rootFile: string
-): Promise<ImporterReturnType> {
+): Promise<Sass.ImporterReturnType> {
   file = path.resolve(file) // ensure os-specific flashes
   // in the same dir, no need to rebase
   const fileDir = path.dirname(file)
@@ -835,14 +963,14 @@ async function rebaseUrls(
 }
 
 // .less
-const less: StylePreprocessor = async (source, options, resolvers) => {
-  const nodeLess = loadPreprocessor('less') as typeof Less
+const less: StylePreprocessor = async (source, root, options, resolvers) => {
+  const nodeLess = loadPreprocessor('less', root) as typeof Less
   const viteResolverPlugin = createViteLessPlugin(
     nodeLess,
     options.filename,
     resolvers
   )
-  source = getSource(source, options.filename, options.additionalData)
+  source = await getSource(source, options.filename, options.additionalData)
 
   let result: Less.RenderOutput | undefined
   try {
@@ -876,13 +1004,15 @@ let ViteLessManager: any
 function createViteLessPlugin(
   less: typeof Less,
   rootFile: string,
-  resolvers: CSSResolvers
+  resolvers: CSSAtImportResolvers
 ): Less.Plugin {
   if (!ViteLessManager) {
     ViteLessManager = class ViteManager extends less.FileManager {
       resolvers
-      constructor(resolvers: CSSResolvers) {
+      rootFile
+      constructor(rootFile: string, resolvers: CSSAtImportResolvers) {
         super()
+        this.rootFile = rootFile
         this.resolvers = resolvers
       }
       supports() {
@@ -902,7 +1032,7 @@ function createViteLessPlugin(
           path.join(dir, '*')
         )
         if (resolved) {
-          const result = await rebaseUrls(resolved, rootFile)
+          const result = await rebaseUrls(resolved, this.rootFile)
           let contents
           if (result && 'contents' in result) {
             contents = result.contents
@@ -922,15 +1052,15 @@ function createViteLessPlugin(
 
   return {
     install(_, pluginManager) {
-      pluginManager.addFileManager(new ViteLessManager(resolvers))
+      pluginManager.addFileManager(new ViteLessManager(rootFile, resolvers))
     },
     minVersion: [3, 0, 0]
   }
 }
 
 // .styl
-const styl: StylePreprocessor = (source, options) => {
-  const nodeStylus = loadPreprocessor('stylus')
+const styl: StylePreprocessor = (source, root, options) => {
+  const nodeStylus = loadPreprocessor('stylus', root)
   try {
     const ref = nodeStylus(source)
     Object.keys(options).forEach((key) => ref.set(key, options[key]))
@@ -948,8 +1078,8 @@ const styl: StylePreprocessor = (source, options) => {
 function getSource(
   source: string,
   filename: string,
-  additionalData?: string | ((source: string, filename: string) => string)
-): string {
+  additionalData?: PreprocessorAdditionalData
+): string | Promise<string> {
   if (!additionalData) return source
   if (typeof additionalData === 'function') {
     return additionalData(source, filename)

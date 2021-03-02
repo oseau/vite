@@ -1,5 +1,12 @@
 import { createHash } from 'crypto'
-import { findAssetFile, getBg, getColor, isBuild } from '../../testUtils'
+import {
+  findAssetFile,
+  getBg,
+  getColor,
+  isBuild,
+  listAssets,
+  readManifest
+} from '../../testUtils'
 
 const assetMatch = isBuild
   ? /\/foo\/assets\/asset\.\w{8}\.png/
@@ -74,6 +81,20 @@ describe('css url() references', () => {
     expect(await getBg('.css-url-relative')).toMatch(assetMatch)
   })
 
+  test('image-set relative', async () => {
+    let imageSet = await getBg('.css-image-set-relative')
+    imageSet.split(', ').forEach((s) => {
+      expect(s).toMatch(assetMatch)
+    })
+  })
+
+  test('image-set without the url() call', async () => {
+    let imageSet = await getBg('.css-image-set-without-url-call')
+    imageSet.split(', ').forEach((s) => {
+      expect(s).toMatch(assetMatch)
+    })
+  })
+
   test('relative in @import', async () => {
     expect(await getBg('.css-url-relative-at-imported')).toMatch(assetMatch)
   })
@@ -92,11 +113,36 @@ describe('css url() references', () => {
     expect(await getBg('.css-url-quotes-base64-inline')).toMatch(match)
   })
 
+  test('multiple urls on the same line', async () => {
+    const bg = await getBg('.css-url-same-line')
+    expect(bg).toMatch(assetMatch)
+    expect(bg).toMatch(iconMatch)
+  })
+
+  test('aliased', async () => {
+    const bg = await getBg('.css-url-aliased')
+    expect(bg).toMatch(assetMatch)
+  })
+
   if (isBuild) {
     test('preserve postfix query/hash', () => {
       expect(findAssetFile(/\.css$/, 'foo')).toMatch(`woff2?#iefix`)
     })
   }
+})
+
+describe('image', () => {
+  test('srcset', async () => {
+    const img = await page.$('.img-src-set')
+    const srcset = await img.getAttribute('srcset')
+    srcset.split(', ').forEach((s) => {
+      expect(s).toMatch(
+        isBuild
+          ? /\/foo\/assets\/asset\.\w{8}\.png \d{1}x/
+          : /\.\/nested\/asset\.png \d{1}x/
+      )
+    })
+  })
 })
 
 describe('svg fragments', () => {
@@ -133,3 +179,18 @@ test('?url import', async () => {
       : `/foo/foo.js`
   )
 })
+
+if (isBuild) {
+  test('manifest', async () => {
+    const manifest = readManifest('foo')
+    const entry = manifest['index.html']
+
+    for (const file of listAssets('foo')) {
+      if (file.endsWith('.css')) {
+        expect(entry.css).toContain(`assets/${file}`)
+      } else if (!file.endsWith('.js')) {
+        expect(entry.assets).toContain(`assets/${file}`)
+      }
+    }
+  })
+}
